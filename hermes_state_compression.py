@@ -22,6 +22,10 @@ _COOLDOWN_ROW_SQL = (
     "SELECT compression_failure_cooldown_until, compression_failure_error FROM sessions WHERE id = ?"
 )
 
+# Same shape as ``hermes_state_messages._TURN_LEASE_ROW_SQL``; defined here so the re-key can read
+# and move the row on the closing transaction's own connection.
+_TURN_LEASE_ROW_SQL = "SELECT holder, expires_at FROM session_turn_leases WHERE conversation_id = ?"
+
 # One forward step of get_compression_chain: the preferred continuation child of ``?``. A reset
 # fork is a separate user-visible conversation (_LISTABLE_CHILD_SQL already surfaces it as its
 # own row), so following it here would hijack the lineage tip projection onto the reset sibling
@@ -321,6 +325,14 @@ class SessionCompressionMixin:
                 "WHERE id = ? AND ended_at IS NULL", (time.time(), parent_session_id))
             if updated.rowcount != 1:
                 raise RuntimeError(f"Compression parent changed during publication: {parent_session_id}")
+            # The closure just moved this conversation's lineage root — and with it the lease key
+            # of every session below it, including the live turn's. Re-key HERE, in the closing
+            # transaction: a second write could be lost between the close and the turn's next
+            # flush, and that window IS the fence (RIC-97). Both the closed parent (whose key now
+            # lands on its new root) and the published continuation (the new terminus — the id a
+            # process that resumed under this conversation is actually writing on) can hold the
+            # row, so both are re-keyed.
+            self._rekey_turn_lease_on_conn(conn, parent_session_id, child_session_id)
             if parent["archived"]:
                 # A live continuation under an idle-sweep archive re-activates the chat; after the
                 # closure above the child is linked into the lineage walk (#117713).
@@ -559,6 +571,74 @@ class SessionCompressionMixin:
             return session_id
         with self._read_ctx() as conn:
             return self._session_turn_lease_key_on_conn(conn, session_id)
+
+    def _rekey_turn_lease_on_conn(self, conn, closing_id: str, continuation_id: Optional[str] = None) -> bool:
+        """Move a live turn-lease row so it still matches the key the turn's own writes resolve.
+
+        The lease is keyed on the conversation's lineage ROOT (``_session_turn_lease_key_on_conn``),
+        and that root moves under a live turn in TWO ways when a compaction closes a session:
+
+        1. **The closure lifts the key of everything below it.** A turn writing on a *descendant*
+           of the closed session re-resolves to the closed session's new root while its row still
+           sits under the pre-close key (the ``cli``/``telegram`` chain).
+        2. **The closure drops the closed session's own key onto its new root, or onto itself.**
+           The process that just published the continuation *adopts it*, so its next write lands on
+           the new session id — which, for a source the lineage walk will not follow (``source='tool'``,
+           i.e. every ``hermes chat -q`` / Paperclip run), is its own lease domain.
+
+        Either way the next flush resolves a different key, finds no row owned by its holder, and is
+        refused as ``session_persistence_failed:turn_lease`` — reported to the operator as "another
+        Hermes process took over this session" although the only process involved built that fence
+        itself (RIC-97; reproduced from live run ``f789c61e``, which resumed
+        ``20260929_165154_f18f7f``, published ``20260929_175723_08ed50``, adopted it, and was then
+        refused on its own new id).
+
+        Must run inside the closing transaction: a second write could be lost between the close and
+        the turn's next flush, and that window IS the fence. The row is never taken over from a
+        key another live row owns — that would hand one process's conversation to another. The
+        table only holds the turns live right now (TTL 300 s), so both scans are a few rows.
+        """
+        new_root = self._session_turn_lease_key_on_conn(conn, closing_id)
+        moved = False
+        # (1) Every row whose key the closure just lifted, whoever holds it. NOTE the ``key ==
+        # new_root`` skip: the row of a turn already writing on the conversation's terminus stays
+        # exactly where it is, so a still-open ancestor closing over it is a no-op here instead of
+        # a move that could be mistaken for a foreign takeover.
+        for row in conn.execute("SELECT conversation_id FROM session_turn_leases").fetchall():
+            key = row["conversation_id"]
+            if key == new_root:
+                continue
+            if self._session_turn_lease_key_on_conn(conn, key) != new_root:
+                continue
+            if conn.execute(_TURN_LEASE_ROW_SQL, (new_root,)).fetchone() is not None:
+                continue
+            conn.execute("UPDATE session_turn_leases SET conversation_id = ? WHERE conversation_id = ?",
+                         (new_root, key))
+            moved = True
+        if not continuation_id or continuation_id == new_root:
+            return moved
+        continuation_root = self._session_turn_lease_key_on_conn(conn, continuation_id)
+        if continuation_root != continuation_id:
+            # The walk DOES follow this continuation (a chaining source): step (1) already keyed the
+            # whole conversation to its root, and there is nothing left to carry.
+            return moved
+        # Carry the rotating conversation's row onto the continuation it published. The row sits at
+        # ``new_root``: closing a session never changes the key the session ITSELF resolves to (the
+        # walk reads its PARENTS' ``end_reason``), so the rotating turn's row is still where step
+        # (1) left it — and step (1) skips it precisely because it already sits at ``new_root``.
+        # This is the ordinary rotation for a source the walk does not follow (``source='tool'``:
+        # every ``hermes chat -q`` / Paperclip run): the process publishes its own continuation,
+        # adopts it, and must not be fenced out of the id it was just handed (RIC-97, live run
+        # ``f789c61e``: resumed ``20260929_165154_f18f7f``, published ``20260929_175723_08ed50``,
+        # adopted it, then refused on its own new id).
+        lease = conn.execute(_TURN_LEASE_ROW_SQL, (new_root,)).fetchone()
+        if lease is None:
+            return moved
+        if conn.execute(_TURN_LEASE_ROW_SQL, (continuation_root,)).fetchone() is not None:
+            return moved
+        conn.execute("UPDATE session_turn_leases SET conversation_id = ? WHERE conversation_id = ?",
+                     (continuation_root, new_root))
+        return True
 
     def try_acquire_session_turn_lease(
         self, session_id: str, holder: str, *, ttl_seconds: float = 300.0, patience_s: Optional[float] = None,

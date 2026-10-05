@@ -82,9 +82,11 @@ _STORAGE_FAILURES: dict[str, tuple[str, str, str]] = {
         "Refresh the client (or start a new turn) and send your message again.",
     ),
     "turn_lease": (
-        "storage_busy",
-        "another Hermes process took over this session",
-        "Wait for it to finish, then send your message again.",
+        "storage_lease_fenced",
+        "this session was rotated by context compression while your turn was running, so the turn "
+        "was fenced from its own transcript",
+        "Nothing is broken and nothing else is using the session: send your message again on the "
+        "same session.",
     ),
     "unknown": (
         "storage_unavailable",

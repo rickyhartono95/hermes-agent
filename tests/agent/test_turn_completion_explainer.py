@@ -118,14 +118,20 @@ def test_explanation_persistence_compression_cause_is_specific():
 
 
 def test_explanation_persistence_turn_lease_cause_is_specific():
+    """The fence is self-inflicted (RIC-97): the copy must name the rotation that moved the
+    key, and must NOT claim another process took the session over."""
     out = AIAgent._format_turn_completion_explanation(
         "session_persistence_failed", "turn_lease"
     )
     lower = out.lower()
-    assert "took over" in lower
+    assert "compression" in lower
+    assert "rotated this session" in lower
+    assert "fenced" in lower
+    assert "nothing else is using the session" in lower
+    assert "took over" not in lower
+    assert "another hermes process" not in lower
     assert "not saved" in lower
     assert "disk" not in lower
-    assert "compression" not in lower
     assert "hermes doctor" not in lower
 
 

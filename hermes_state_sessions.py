@@ -494,11 +494,20 @@ class SessionSessionsMixin:
 
     def end_session(self, session_id: str, end_reason: str) -> None:
         """Mark a session ended; the first end_reason wins (a compression split must keep
-        ``'compression'`` even if a stale end_session() lands later); reopen_session() to re-end."""
-        self._execute_write(lambda conn: self._end_and_bump(
-            conn, "UPDATE sessions SET ended_at = ?, end_reason = ? WHERE id = ? AND ended_at IS NULL",
-            (time.time(), end_reason, session_id), session_id, end_reason,
-        ))
+        ``'compression'`` even if a stale end_session() lands later); reopen_session() to re-end.
+
+        A ``'compression'`` closure moves the conversation's lineage root, which moves the
+        lease key of every session below it -- so it must re-key the live lease row in this
+        same transaction, or the turn that is running right now is fenced out of its own
+        conversation on its next flush (RIC-97)."""
+        def _do(conn):
+            changed = self._end_and_bump(
+                conn, "UPDATE sessions SET ended_at = ?, end_reason = ? WHERE id = ? AND ended_at IS NULL",
+                (time.time(), end_reason, session_id), session_id, end_reason)
+            if changed and end_reason == "compression":
+                self._rekey_turn_lease_on_conn(conn, session_id)
+            return changed
+        self._execute_write(_do)
 
     def _end_and_bump(self, conn, sql: str, params: tuple, session_id: str, reason: str) -> int:
         """Run an end-stamp UPDATE; only a boundary this call actually wrote advances the
